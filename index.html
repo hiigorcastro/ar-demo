@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AR Demo — Leitor de Gôndola</title>
+<style>
+:root{--tag:#FFD23F;--ink:#16222D}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#000;color:#fff;font:500 16px/1.4 system-ui,-apple-system,sans-serif;overflow:hidden}
+#wrap{position:fixed;inset:0}
+video,canvas{position:absolute;inset:0;width:100%;height:100%}
+video{object-fit:cover}
+#hud{position:absolute;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 10px;display:flex;justify-content:space-between;align-items:center;background:linear-gradient(#000a,#0000)}
+#hud b{background:var(--tag);color:var(--ink);padding:2px 8px;border-radius:4px}
+#fps{font-variant-numeric:tabular-nums;opacity:.85}
+#start{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:#121C25}
+#start h1{margin:0;font-size:1.6rem}
+#start p{margin:0;color:#9AA8B4;max-width:320px}
+button{font:700 1.1rem system-ui,sans-serif;background:var(--tag);color:var(--ink);border:0;border-radius:12px;padding:16px 28px}
+button:disabled{opacity:.6}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+  <div id="hud"><span><b>AR</b> ao vivo</span><span id="fps">—</span></div>
+  <div id="start">
+    <h1>Demo de AR ao vivo</h1>
+    <p>Aponte a câmera para objetos do dia a dia: garrafa, copo, celular, livro, fruta. As caixas acompanham o objeto em tempo real, processadas no próprio celular.</p>
+    <button id="go">Iniciar câmera</button>
+    <p id="info"></p>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const PT={person:'pessoa',bottle:'garrafa',cup:'copo','wine glass':'taça',bowl:'tigela',banana:'banana',apple:'maçã',orange:'laranja',broccoli:'brócolis',carrot:'cenoura',sandwich:'sanduíche',pizza:'pizza',donut:'rosquinha',cake:'bolo','cell phone':'celular',laptop:'notebook',keyboard:'teclado',mouse:'mouse',remote:'controle',book:'livro',clock:'relógio',vase:'vaso',scissors:'tesoura','teddy bear':'pelúcia',toothbrush:'escova de dente',chair:'cadeira',couch:'sofá','potted plant':'planta',tv:'TV',backpack:'mochila',handbag:'bolsa',umbrella:'guarda-chuva',spoon:'colher',fork:'garfo',knife:'faca','dining table':'mesa',refrigerator:'geladeira',microwave:'micro-ondas',sink:'pia',dog:'cachorro',cat:'gato'};
+const PRODUTO=new Set(['bottle','cup','wine glass','bowl','banana','apple','orange','broccoli','carrot','sandwich','donut','cake','book','cell phone','toothbrush']);
+const v=document.getElementById('v'),c=document.getElementById('c'),g=c.getContext('2d');
+const fpsEl=document.getElementById('fps'),info=document.getElementById('info'),go=document.getElementById('go');
+let model,last=performance.now(),frames=0,tracks=[];
+
+const embutido=(()=>{try{return window.top!==window.self}catch(e){return true}})();
+if(embutido||!window.isSecureContext||!navigator.mediaDevices){
+  info.innerHTML='Esta página está aberta dentro de outro app (ou sem HTTPS), e aí a câmera ao vivo fica bloqueada.<br><br>Abra pelo link do GitHub Pages direto no <b>Safari</b>.';
+  go.disabled=true;
+}
+go.onclick=async()=>{
+  go.disabled=true;
+  try{
+    info.textContent='Abrindo câmera…';
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+    v.srcObject=s; await v.play();
+    info.textContent='Carregando modelo (~5 MB, só na primeira vez)…';
+    model=await cocoSsd.load({base:'lite_mobilenet_v2'});
+    document.getElementById('start').style.display='none';
+    loop();
+  }catch(e){
+    go.disabled=false;
+    info.textContent=(e&&e.name==='NotAllowedError')?'Câmera bloqueada. Confira se abriu pelo link do GitHub Pages no Safari; se sim, toque em "aA" na barra de endereço → Ajustes do Site → Câmera → Permitir.':'Não foi possível iniciar: '+(e.message||e);
+  }
+};
+
+function fit(){
+  const dpr=window.devicePixelRatio||1;
+  const w=innerWidth,h=innerHeight;
+  if(c.width!==w*dpr){c.width=w*dpr;c.height=h*dpr;g.setTransform(dpr,0,0,dpr,0,0);}
+  const k=Math.max(w/v.videoWidth,h/v.videoHeight);
+  return {k,ox:(w-v.videoWidth*k)/2,oy:(h-v.videoHeight*k)/2,w,h};
+}
+
+// suaviza as caixas entre quadros para não tremer
+function smooth(dets){
+  const out=[];
+  for(const d of dets){
+    let best=null,bd=1e9;
+    for(const t of tracks){ if(t.cls!==d.class) continue;
+      const dist=Math.hypot(t.b[0]-d.bbox[0],t.b[1]-d.bbox[1]); if(dist<bd){bd=dist;best=t;} }
+    const b=d.bbox;
+    if(best&&bd<120){ best.b=best.b.map((x,i)=>x*0.6+b[i]*0.4); best.score=d.score; best.seen=0; out.push(best); }
+    else out.push({cls:d.class,b:[...b],score:d.score,seen:0});
+  }
+  for(const t of tracks){ if(!out.includes(t)&&t.seen<4){ t.seen++; out.push(t);} }
+  tracks=out; return out;
+}
+
+function rr(x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
+
+async function loop(){
+  const dets=await model.detect(v,10,0.5);
+  const {k,ox,oy,w,h}=fit();
+  g.clearRect(0,0,w,h);
+  for(const t of smooth(dets)){
+    const [bx,by,bw,bh]=t.b, x=ox+bx*k, y=oy+by*k, W=bw*k, H=bh*k;
+    const prod=PRODUTO.has(t.cls), col=prod?'#FFD23F':'#3CCB7F';
+    g.globalAlpha=t.seen?0.45:1;
+    g.lineWidth=3; g.strokeStyle=col; g.fillStyle=col+'22';
+    rr(x,y,W,H,10); g.fill(); g.stroke();
+    // cartão flutuante estilo AR
+    const nome=(PT[t.cls]||t.cls), linha2=prod?'produto · preço: aguardando leitura':Math.round(t.score*100)+'% de confiança';
+    g.font='700 17px system-ui,sans-serif'; const w1=g.measureText(nome).width;
+    g.font='500 13px system-ui,sans-serif'; const w2=g.measureText(linha2).width;
+    const cw=Math.max(w1,w2)+24, ch=50, cx=Math.min(Math.max(6,x+W/2-cw/2),w-cw-6), cy=Math.max(48,y-ch-10);
+    g.fillStyle='rgba(18,28,37,.9)'; rr(cx,cy,cw,ch,10); g.fill();
+    g.strokeStyle=col; g.lineWidth=2; g.stroke();
+    g.beginPath(); g.moveTo(x+W/2,cy+ch); g.lineTo(x+W/2,y); g.stroke();
+    g.fillStyle=col; g.font='700 17px system-ui,sans-serif'; g.fillText(nome,cx+12,cy+21);
+    g.fillStyle='#E8EDF1'; g.font='500 13px system-ui,sans-serif'; g.fillText(linha2,cx+12,cy+40);
+    g.globalAlpha=1;
+  }
+  frames++; const now=performance.now();
+  if(now-last>1000){ fpsEl.textContent=frames+' fps'; frames=0; last=now; }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
